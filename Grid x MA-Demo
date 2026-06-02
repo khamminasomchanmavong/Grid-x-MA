@@ -1,0 +1,574 @@
+//+------------------------------------------------------------------+
+//|                                          Grid x MA.mq5           |
+//|                                      Professional Grid Trading EA |
+//|                              Copyright 2025, Professional Trader |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Professional Trader"
+#property link      "https://www.facebook.com/kouy.somchanmavong.77"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\AccountInfo.mqh>
+#include <Trade\SymbolInfo.mqh>
+
+enum ENUM_TRADE_DIRECTION { TRADE_BUY_ONLY, TRADE_SELL_ONLY, TRADE_BUY_AND_SELL };
+enum ENUM_EA_STATE        { STATE_ACTIVE, STATE_COOLDOWN, STATE_RECOVERY };
+enum ENUM_GRID_MODE       { MODE_GRID, MODE_TREND_RECOVERY };
+
+#define MAGIC_NUMBER  123456
+#define TRADE_COMMENT "GridEA"
+#define MA_METHOD     MODE_EMA
+#define MA_PRICE      PRICE_CLOSE
+#define UseMASignal   true
+#define MAX_SLOTS     200
+
+input group "=== MA FILTER SETTINGS ==="
+input int      MAPeriod                = 81;
+
+input group "=== TRADE DIRECTION ==="
+input ENUM_TRADE_DIRECTION TradeDirection = TRADE_BUY_AND_SELL;
+
+input group "=== GRID MODE ==="
+input ENUM_GRID_MODE GridMode          = MODE_GRID;
+
+input group "=== GRID PARAMETERS ==="
+input double   LotSize                 = 0.05;
+input double   LotStep                 = 0.01;
+input int      GridStepPoints          = 250;
+input int      TakeProfitPoints        = 300;
+input int      MaxOrders               = 100;
+
+input group "=== RISK MANAGEMENT ==="
+input double   RecoveryEquityThreshold = 0.0;
+input int      CooldownMinutes         = 15;
+
+CTrade        trade;
+CPositionInfo position;
+CAccountInfo  account;
+CSymbolInfo   m_symbol;
+
+ENUM_EA_STATE      currentState    = STATE_ACTIVE;
+datetime           cooldownEndTime = 0;
+double             initialBalance  = 0;
+int                maHandle        = INVALID_HANDLE;
+double             maBuffer[];
+datetime           lastBuyGridTime  = 0;
+datetime           lastSellGridTime = 0;
+
+ENUM_POSITION_TYPE trCurrentTrend  = POSITION_TYPE_BUY;
+bool               trInitialized   = false;
+
+//--- Slot tracking arrays: true = this slot has been ordered
+//    Index = slot number (1-based).  Reset when basket is cleared.
+bool buySlotFilled[MAX_SLOTS];
+bool sellSlotFilled[MAX_SLOTS];
+double buyAnchor  = 0;
+double sellAnchor = 0;
+
+//+------------------------------------------------------------------+
+//| Reset slot tracking for one side                                 |
+//+------------------------------------------------------------------+
+void ResetSlots(ENUM_POSITION_TYPE side)
+{
+   if(side == POSITION_TYPE_BUY)
+   {
+      buyAnchor = 0;
+      for(int i = 0; i < MAX_SLOTS; i++) buySlotFilled[i] = false;
+   }
+   else
+   {
+      sellAnchor = 0;
+      for(int i = 0; i < MAX_SLOTS; i++) sellSlotFilled[i] = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Mark slot as filled                                              |
+//+------------------------------------------------------------------+
+void MarkSlot(ENUM_POSITION_TYPE side, int slot)
+{
+   if(slot < 1 || slot >= MAX_SLOTS) return;
+   if(side == POSITION_TYPE_BUY)  buySlotFilled[slot]  = true;
+   else                           sellSlotFilled[slot] = true;
+}
+
+//+------------------------------------------------------------------+
+//| Check if slot is already filled                                  |
+//+------------------------------------------------------------------+
+bool IsSlotFilled(ENUM_POSITION_TYPE side, int slot)
+{
+   if(slot < 1 || slot >= MAX_SLOTS) return true; // treat out-of-range as filled
+   if(side == POSITION_TYPE_BUY)  return buySlotFilled[slot];
+   else                           return sellSlotFilled[slot];
+}
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(!m_symbol.Name(_Symbol))
+   {
+      Print("Failed to initialize symbol");
+      return(INIT_FAILED);
+   }
+
+   trade.SetExpertMagicNumber(MAGIC_NUMBER);
+
+   long marginMode = AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   Print("Account margin mode: ", marginMode,
+         " | Hedging: ", (marginMode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING),
+         " | GridStep: ", GridStepPoints, " x ", m_symbol.Point(),
+         " = ", GridStepPoints * m_symbol.Point());
+
+   if(UseMASignal)
+   {
+      maHandle = iMA(_Symbol, _Period, MAPeriod, 0, MA_METHOD, MA_PRICE);
+      if(maHandle == INVALID_HANDLE)
+      {
+         Print("Failed to create MA indicator");
+         return(INIT_FAILED);
+      }
+      ArraySetAsSeries(maBuffer, true);
+   }
+
+   initialBalance = account.Balance();
+   trInitialized  = false;
+   ResetSlots(POSITION_TYPE_BUY);
+   ResetSlots(POSITION_TYPE_SELL);
+
+   //--- Reconstruct slot state from any already-open positions
+   RebuildSlotState();
+
+   bool isDemo     = (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO);
+   bool isBacktest = MQLInfoInteger(MQL_TESTER);
+
+   if(!isDemo && !isBacktest)
+   {
+      Print("❌ This EA is allowed to run only on Demo accounts or in Backtest mode.");
+      return(INIT_FAILED);
+   }
+
+   if(isBacktest) Print("✅ EA started in Backtest mode.");
+   else if(isDemo) Print("✅ EA started on a Demo account.");
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Rebuild slot tracking from open positions on attach/restart      |
+//+------------------------------------------------------------------+
+void RebuildSlotState()
+{
+   ResetSlots(POSITION_TYPE_BUY);
+   ResetSlots(POSITION_TYPE_SELL);
+
+   //--- Find anchors (earliest position per side)
+   datetime earliestBuy  = (datetime)INT_MAX;
+   datetime earliestSell = (datetime)INT_MAX;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(position.SelectByIndex(i))
+      {
+         if(position.Symbol() != _Symbol || position.Magic() != MAGIC_NUMBER) continue;
+         if(position.PositionType() == POSITION_TYPE_BUY  && position.Time() < earliestBuy)
+         {
+            earliestBuy = position.Time();
+            buyAnchor   = position.PriceOpen();
+         }
+         if(position.PositionType() == POSITION_TYPE_SELL && position.Time() < earliestSell)
+         {
+            earliestSell = position.Time();
+            sellAnchor   = position.PriceOpen();
+         }
+      }
+   }
+
+   //--- Assign each open position to its nearest slot
+   double gridStep = GridStepPoints * m_symbol.Point();
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(position.SelectByIndex(i))
+      {
+         if(position.Symbol() != _Symbol || position.Magic() != MAGIC_NUMBER) continue;
+
+         ENUM_POSITION_TYPE side   = position.PositionType();
+         double             anchor = (side == POSITION_TYPE_BUY) ? buyAnchor : sellAnchor;
+         if(anchor == 0) continue;
+
+         double dist = (side == POSITION_TYPE_BUY)
+                       ? anchor - position.PriceOpen()
+                       : position.PriceOpen() - anchor;
+
+         int slot = (int)MathRound(dist / gridStep);
+         if(slot == 0) slot = 0; // anchor itself — we don't track slot 0 in arrays
+         if(slot >= 1 && slot < MAX_SLOTS) MarkSlot(side, slot);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(maHandle != INVALID_HANDLE) IndicatorRelease(maHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!m_symbol.RefreshRates()) return;
+
+   CheckRecoveryMode();
+   CheckCooldown();
+
+   if(currentState != STATE_ACTIVE) return;
+
+   if(GridMode == MODE_TREND_RECOVERY)
+   {
+      RunTrendRecoveryMode();
+      return;
+   }
+
+   if(CheckTakeProfit())
+   {
+      CloseAllPositions();
+      ResetSlots(POSITION_TYPE_BUY);
+      ResetSlots(POSITION_TYPE_SELL);
+      EnterCooldown();
+      return;
+   }
+
+   if(CountPositions() == 0)
+      OpenFirstPosition();
+   else
+      CheckGridEntry();
+}
+
+//+------------------------------------------------------------------+
+void CheckRecoveryMode()
+{
+   double ep = (account.Equity() / account.Balance()) * 100;
+   if(ep < RecoveryEquityThreshold && currentState != STATE_RECOVERY)
+   {
+      currentState = STATE_RECOVERY;
+      Print("Entering Recovery Mode - Equity: ", DoubleToString(ep, 2), "%");
+   }
+   else if(ep >= RecoveryEquityThreshold && currentState == STATE_RECOVERY)
+   {
+      currentState = STATE_ACTIVE;
+      Print("Exiting Recovery Mode - Equity: ", DoubleToString(ep, 2), "%");
+   }
+}
+
+void CheckCooldown()
+{
+   if(currentState == STATE_COOLDOWN && TimeCurrent() >= cooldownEndTime)
+   {
+      currentState = STATE_ACTIVE;
+      Print("Cooldown ended - Trading resumed");
+   }
+}
+
+void EnterCooldown()
+{
+   currentState    = STATE_COOLDOWN;
+   cooldownEndTime = TimeCurrent() + (CooldownMinutes * 60);
+   Print("Entering cooldown for ", CooldownMinutes, " minutes");
+}
+
+ENUM_ORDER_TYPE GetMADirection()
+{
+   if(CopyBuffer(maHandle, 0, 0, 1, maBuffer) != 1) return (ENUM_ORDER_TYPE)-1;
+   return (m_symbol.Bid() > maBuffer[0]) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+}
+
+ENUM_ORDER_TYPE GetTradeDirection()
+{
+   if(UseMASignal)
+   {
+      if(CountPositions(POSITION_TYPE_BUY)  > 0) return ORDER_TYPE_BUY;
+      if(CountPositions(POSITION_TYPE_SELL) > 0) return ORDER_TYPE_SELL;
+      return GetMADirection();
+   }
+   if(TradeDirection == TRADE_BUY_ONLY)  return ORDER_TYPE_BUY;
+   if(TradeDirection == TRADE_SELL_ONLY) return ORDER_TYPE_SELL;
+   return (ENUM_ORDER_TYPE)-1;
+}
+
+int CountPositions(ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)-1)
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(position.SelectByIndex(i))
+         if(position.Symbol() == _Symbol && position.Magic() == MAGIC_NUMBER)
+            if(type == (ENUM_POSITION_TYPE)-1 || position.PositionType() == type)
+               count++;
+   return count;
+}
+
+double GetAnchorPrice(ENUM_POSITION_TYPE side)
+{
+   return (side == POSITION_TYPE_BUY) ? buyAnchor : sellAnchor;
+}
+
+//+------------------------------------------------------------------+
+//| Open first position and set anchor                               |
+//+------------------------------------------------------------------+
+void OpenFirstPosition()
+{
+   ENUM_ORDER_TYPE dir = GetTradeDirection();
+   if(dir == (ENUM_ORDER_TYPE)-1) return;
+
+   if(dir == ORDER_TYPE_BUY  && lastBuyGridTime  == TimeCurrent()) return;
+   if(dir == ORDER_TYPE_SELL && lastSellGridTime == TimeCurrent()) return;
+
+   double price = (dir == ORDER_TYPE_BUY) ? m_symbol.Ask() : m_symbol.Bid();
+
+   if(trade.PositionOpen(_Symbol, dir, LotSize, price, 0, 0, TRADE_COMMENT))
+   {
+      ENUM_POSITION_TYPE side = (dir == ORDER_TYPE_BUY) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+      //--- Set anchor and reset slots for this side
+      ResetSlots(side);
+      if(side == POSITION_TYPE_BUY)  { buyAnchor  = price; lastBuyGridTime  = TimeCurrent(); }
+      else                           { sellAnchor = price; lastSellGridTime = TimeCurrent(); }
+      Print("First position opened: ", EnumToString(dir), " anchor=", price);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Core grid logic — slot-based, exact spacing, no duplicates       |
+//|                                                                  |
+//| Slots are numbered from the anchor:                              |
+//|   BUY  slot[n] = anchor - n * gridStep                          |
+//|   SELL slot[n] = anchor + n * gridStep                          |
+//|                                                                  |
+//| A slot is eligible when current price has crossed it.            |
+//| Whether a slot is filled is tracked in buySlotFilled/             |
+//| sellSlotFilled arrays — set when order is sent, never cleared    |
+//| until the whole basket is closed.                                |
+//| One slot filled per tick.                                        |
+//+------------------------------------------------------------------+
+bool ProcessGridSide(ENUM_POSITION_TYPE side)
+{
+   int sideCount = CountPositions(side);
+   if(sideCount == 0)        return false;
+   if(sideCount >= MaxOrders) return false;
+
+   if(side == POSITION_TYPE_BUY  && lastBuyGridTime  == TimeCurrent()) return false;
+   if(side == POSITION_TYPE_SELL && lastSellGridTime == TimeCurrent()) return false;
+
+   double anchor = GetAnchorPrice(side);
+   if(anchor == 0) return false;
+
+   double gridStep     = GridStepPoints * m_symbol.Point();
+   double currentPrice = (side == POSITION_TYPE_BUY) ? m_symbol.Ask() : m_symbol.Bid();
+
+   double rawDist = (side == POSITION_TYPE_BUY)
+                    ? anchor - currentPrice
+                    : currentPrice - anchor;
+
+   if(rawDist < gridStep) return false; // price hasn't moved a full step yet
+
+   int maxSlot = (int)MathFloor(rawDist / gridStep);
+   if(maxSlot < 1) return false;
+   if(maxSlot >= MaxOrders) maxSlot = MaxOrders - 1;
+
+   //--- Find the first unfilled slot that price has already crossed
+   for(int slot = 1; slot <= maxSlot; slot++)
+   {
+      if(IsSlotFilled(side, slot)) continue;
+
+      //--- This slot is empty and eligible — place order now
+      double placePrice = (side == POSITION_TYPE_BUY) ? m_symbol.Ask() : m_symbol.Bid();
+      double newLot     = NormalizeDouble(LotSize + LotStep * slot, 2);
+      ENUM_ORDER_TYPE order = (side == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+      //--- Mark BEFORE sending to prevent duplicate on same tick
+      MarkSlot(side, slot);
+
+      if(trade.PositionOpen(_Symbol, order, newLot, placePrice, 0, 0, TRADE_COMMENT))
+      {
+         if(side == POSITION_TYPE_BUY) lastBuyGridTime  = TimeCurrent();
+         else                          lastSellGridTime = TimeCurrent();
+         double slotPrice = (side == POSITION_TYPE_BUY)
+                            ? anchor - slot * gridStep
+                            : anchor + slot * gridStep;
+         Print("Grid slot #", slot,
+               " (", EnumToString(side), ")",
+               " slotPrice=",  DoubleToString(slotPrice, m_symbol.Digits()),
+               " placedAt=",   DoubleToString(placePrice, m_symbol.Digits()),
+               " Lot=", DoubleToString(newLot, 2));
+      }
+      else
+      {
+         //--- Order failed — unmark so it retries next tick, but still throttle
+         MarkSlot(side, slot); // keep marked — don't retry a failed slot immediately
+         if(side == POSITION_TYPE_BUY) lastBuyGridTime  = TimeCurrent();
+         else                          lastSellGridTime = TimeCurrent();
+      }
+      return true; // one per tick
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void CheckGridEntry()
+{
+   if(CountPositions() >= MaxOrders) return;
+
+   ENUM_POSITION_TYPE posType = POSITION_TYPE_BUY;
+   bool found = false;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(position.SelectByIndex(i))
+         if(position.Symbol() == _Symbol && position.Magic() == MAGIC_NUMBER)
+         { posType = position.PositionType(); found = true; break; }
+
+   if(!found) return;
+   ProcessGridSide(posType);
+}
+
+//+------------------------------------------------------------------+
+bool ManageBasket(ENUM_POSITION_TYPE side)
+{
+   if(CountPositions(side) == 0) return false;
+
+   if(CheckTakeProfitSide(side))
+   {
+      ClosePositionsSide(side);
+      ResetSlots(side);
+      Print("Basket TP hit: ", EnumToString(side), " positions closed");
+      return true;
+   }
+
+   ProcessGridSide(side);
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void RunTrendRecoveryMode()
+{
+   if(!UseMASignal)
+   {
+      if(CheckTakeProfit()) { CloseAllPositions(); ResetSlots(POSITION_TYPE_BUY); ResetSlots(POSITION_TYPE_SELL); EnterCooldown(); return; }
+      if(CountPositions() == 0) OpenFirstPosition();
+      else CheckGridEntry();
+      return;
+   }
+
+   ENUM_ORDER_TYPE maDir = GetMADirection();
+   if(maDir == (ENUM_ORDER_TYPE)-1) return;
+
+   ENUM_POSITION_TYPE newTrend = (maDir == ORDER_TYPE_BUY) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
+   if(!trInitialized) { trCurrentTrend = newTrend; trInitialized = true; }
+
+   if(newTrend != trCurrentTrend)
+   {
+      Print("Trend flipped: ", EnumToString(trCurrentTrend), " -> ", EnumToString(newTrend));
+      trCurrentTrend = newTrend;
+   }
+
+   ENUM_POSITION_TYPE oppSide = (trCurrentTrend == POSITION_TYPE_BUY)
+                                ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+
+   if(CountPositions(oppSide)        > 0) ManageBasket(oppSide);
+   if(CountPositions(trCurrentTrend) == 0)
+   {
+      bool throttled = (trCurrentTrend == POSITION_TYPE_BUY)
+                       ? (lastBuyGridTime  == TimeCurrent())
+                       : (lastSellGridTime == TimeCurrent());
+      if(throttled) return;
+
+      double price = (trCurrentTrend == POSITION_TYPE_BUY) ? m_symbol.Ask() : m_symbol.Bid();
+      ENUM_ORDER_TYPE ot = (trCurrentTrend == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      if(trade.PositionOpen(_Symbol, ot, LotSize, price, 0, 0, TRADE_COMMENT))
+      {
+         ResetSlots(trCurrentTrend);
+         if(trCurrentTrend == POSITION_TYPE_BUY) { buyAnchor  = price; lastBuyGridTime  = TimeCurrent(); }
+         else                                    { sellAnchor = price; lastSellGridTime = TimeCurrent(); }
+         Print("Trend-Recovery: first ", EnumToString(ot), " opened at ", price);
+      }
+   }
+   else ManageBasket(trCurrentTrend);
+}
+
+//+------------------------------------------------------------------+
+bool CheckTakeProfitSide(ENUM_POSITION_TYPE side)
+{
+   double totalLots = 0, avgPrice = 0;
+   int posCount = 0;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(position.SelectByIndex(i))
+         if(position.Symbol() == _Symbol && position.Magic() == MAGIC_NUMBER
+            && position.PositionType() == side)
+         {
+            totalLots += position.Volume();
+            avgPrice  += position.PriceOpen() * position.Volume();
+            posCount++;
+         }
+
+   if(posCount == 0) return false;
+   avgPrice /= totalLots;
+
+   double tpDist  = TakeProfitPoints * m_symbol.Point();
+   double tpPrice = (side == POSITION_TYPE_BUY) ? avgPrice + tpDist : avgPrice - tpDist;
+   double cur     = (side == POSITION_TYPE_BUY) ? m_symbol.Bid() : m_symbol.Ask();
+
+   return ((side == POSITION_TYPE_BUY  && cur >= tpPrice) ||
+           (side == POSITION_TYPE_SELL && cur <= tpPrice));
+}
+
+void ClosePositionsSide(ENUM_POSITION_TYPE side)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+      if(position.SelectByIndex(i))
+         if(position.Symbol() == _Symbol && position.Magic() == MAGIC_NUMBER
+            && position.PositionType() == side)
+            trade.PositionClose(position.Ticket());
+}
+
+bool CheckTakeProfit()
+{
+   double totalLots = 0, avgPrice = 0;
+   int posCount = 0;
+   ENUM_POSITION_TYPE posType = POSITION_TYPE_BUY;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(position.SelectByIndex(i))
+         if(position.Symbol() == _Symbol && position.Magic() == MAGIC_NUMBER)
+         {
+            totalLots += position.Volume();
+            avgPrice  += position.PriceOpen() * position.Volume();
+            posType    = position.PositionType();
+            posCount++;
+         }
+
+   if(posCount == 0) return false;
+   avgPrice /= totalLots;
+
+   double tpDist  = TakeProfitPoints * m_symbol.Point();
+   double tpPrice = (posType == POSITION_TYPE_BUY) ? avgPrice + tpDist : avgPrice - tpDist;
+   double cur     = (posType == POSITION_TYPE_BUY) ? m_symbol.Bid() : m_symbol.Ask();
+
+   return ((posType == POSITION_TYPE_BUY  && cur >= tpPrice) ||
+           (posType == POSITION_TYPE_SELL && cur <= tpPrice));
+}
+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+      if(position.SelectByIndex(i))
+         if(position.Symbol() == _Symbol && position.Magic() == MAGIC_NUMBER)
+            trade.PositionClose(position.Ticket());
+   Print("All positions closed - Take Profit reached");
+}
+//+------------------------------------------------------------------+
